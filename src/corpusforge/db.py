@@ -701,20 +701,38 @@ class CorpusDB:
         resolved_text: Optional[str] = None,
     ) -> None:
         """
-        Resolve a cross-reference (accept/reject a merge proposal).
-
-        Args:
-            status:        'accepted' or 'rejected'
-            resolved_by:   'hil', 'llm', or 'auto'
-            resolved_text: merged text if accepted, None if rejected
+        Resolve a cross-reference and automatically clean up redundant overlaps.
         """
         with self._auto_connect() as conn:
+            # 1. Fetch the chunk IDs involved in this specific resolution
+            row = conn.execute(
+                "SELECT chunk_a_id, chunk_b_id FROM cross_refs WHERE id = ?", 
+                (cross_ref_id,)
+            ).fetchone()
+            
+            if not row:
+                return
+
+            # 2. Update the target cross-reference as requested
             conn.execute(
                 """UPDATE cross_refs
                    SET status = ?, resolved_by = ?, resolved_text = ?, resolved_at = ?
                    WHERE id = ?""",
                 (status, resolved_by, resolved_text, self._now(), cross_ref_id),
             )
+
+            # 3. AUTO-CLEANUP: If we accepted a merge/dedup, all other PENDING 
+            # overlaps involving either chunk are now mathematically redundant.
+            if status == 'accepted':
+                conn.execute(
+                    """UPDATE cross_refs 
+                       SET status = 'redundant', resolved_at = ? 
+                       WHERE status = 'pending' 
+                       AND id != ? 
+                       AND (chunk_a_id IN (?, ?) OR chunk_b_id IN (?, ?))""",
+                    (self._now(), cross_ref_id, row['chunk_a_id'], row['chunk_b_id'], 
+                     row['chunk_a_id'], row['chunk_b_id'])
+                )
 
     # ═══════════════════════════════════════════════════════════════════
     # FEEDBACK

@@ -22,6 +22,8 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.table import Table
+from rich.prompt import Prompt
+
 
 from .db import CorpusDB
 from .ingester import ingest_file, IngestResult
@@ -385,6 +387,173 @@ def cmd_topic_summarize(args: argparse.Namespace) -> None:
     console.print(f"[bold]New Name:[/bold] {metadata.get('name')}")
     console.print(f"[bold]Description:[/bold] {metadata.get('description')}\n")
 
+def cmd_topic_rationalize(args: argparse.Namespace) -> None:
+    """cf topic rationalize <id> — Find and stage overlapping chunks."""
+    from .rationalizer import TopicRationalizer
+    from .db import CorpusDB
+    
+    db = CorpusDB()
+    rat = TopicRationalizer(db)
+    
+    console.print(f"Analyzing internal overlaps for Topic {args.topic_id}...")
+    overlaps = rat.find_topic_overlaps(args.topic_id, threshold=args.threshold)
+    
+    if not overlaps:
+        console.print(f"[green]No significant overlaps found (Threshold: {args.threshold}).[/green]")
+        return
+
+    # Convert to format expected by db.insert_cross_refs_batch:
+    # (chunk_a, chunk_b, similarity, relationship)
+    refs = [(a, b, score, "overlap") for a, b, score in overlaps]
+    db.insert_cross_refs_batch(refs)
+    
+    console.print(f"\n[bold green]✓ Found {len(overlaps)} overlapping pairs![/bold green]")
+    console.print(f"Relationships saved to 'cross_refs' table for review.")
+
+from rich.prompt import Prompt
+
+def cmd_db_resolve(args: argparse.Namespace) -> None:
+    """cf db resolve — Interactive loop to review and merge pending cross-references."""
+    from .db import CorpusDB
+    from .summarizer import CorpusSummarizer
+    
+    db = CorpusDB()
+    summarizer = CorpusSummarizer()
+    
+    pending = db.get_pending_cross_refs()
+    if not pending:
+        console.print("[green]No pending cross-references to resolve![/green]")
+        return
+        
+    console.print(f"\n[bold blue]Found {len(pending)} pending overlaps requiring review.[/bold blue]")
+    console.print("For each pair, you can ask the LLM to propose a merge, or reject the overlap.")
+    
+    for idx, ref in enumerate(pending, 1):
+        console.print(f"\n[bold magenta]=== Overlap {idx}/{len(pending)} (Similarity: {ref['similarity']:.3f}) ===[/bold magenta]")
+        
+        # Display the source files and the text
+        console.print(f"[cyan]Chunk A ({ref['file_a']}):[/cyan] {ref['content_a']}")
+        console.print(f"[cyan]Chunk B ({ref['file_b']}):[/cyan] {ref['content_b']}\n")
+        
+        # Interactive Prompt
+        action = Prompt.ask(
+            "Action [[bold green]M[/bold green]erge via LLM, Keep [bold magenta]A[/bold magenta], Keep [bold blue]B[/bold blue], [bold red]R[/bold red]eject, [bold yellow]S[/bold yellow]kip, [bold cyan]Q[/bold cyan]uit]", 
+            choices=["m", "a", "b", "r", "s", "q"], 
+            default="m",
+            show_choices=False
+        )
+        
+        if action == "q":
+            console.print("[blue]Exiting review loop. Progress is saved.[/blue]")
+            break
+        elif action == "s":
+            continue
+        elif action == "r":
+            # Mark as rejected so we don't flag these two chunks again
+            db.resolve_cross_ref(ref["id"], status="rejected", resolved_by="hil")
+            console.print("[red]Overlap rejected.[/red]")
+            continue
+        elif action == "a":
+            # Bypass LLM and keep Chunk A
+            db.resolve_cross_ref(ref["id"], status="accepted", resolved_by="hil", resolved_text=ref["content_a"])
+            console.print("[green]Deduplication complete! (Chunk A preserved).[/green]")
+            continue
+        elif action == "b":
+            # Bypass LLM and keep Chunk B
+            db.resolve_cross_ref(ref["id"], status="accepted", resolved_by="hil", resolved_text=ref["content_b"])
+            console.print("[green]Deduplication complete! (Chunk B preserved).[/green]")
+            continue
+            
+        # If they chose 'Merge'
+        if action == "m":
+            console.print("\n[dim]Asking Gemini to merge...[/dim]")
+            merged_text = summarizer.propose_merge(ref["content_a"], ref["content_b"])
+            
+            console.print("\n[bold yellow]--- LLM Proposed Merge ---[/bold yellow]")
+            console.print(merged_text)
+            console.print("[bold yellow]----------------------------[/bold yellow]\n")
+            
+            # Interactive Prompt 2 (FIXED: merged suffix into main string)
+            confirm = Prompt.ask(
+                "Accept this merge? [[bold green]Y[/bold green]es, [bold red]N[/bold red]o, [bold cyan]Q[/bold cyan]uit]", 
+                choices=["y", "n", "q"], 
+                default="y",
+                show_choices=False
+            )
+            
+            if confirm == "y":
+                # Save the accepted merge text
+                db.resolve_cross_ref(ref["id"], status="accepted", resolved_by="llm", resolved_text=merged_text)
+                console.print("[green]Merge accepted and saved![/green]")
+            elif confirm == "q":
+                break
+            else:
+                console.print("[yellow]Merge discarded. Leaving as pending.[/yellow]")
+
+def cmd_db_autoresolve(args: argparse.Namespace) -> None:
+    """cf db auto-resolve — Silently deduplicate exact 1.0 matches and subset matches."""
+    from .db import CorpusDB
+    from .rationalizer import TopicRationalizer
+    
+    rat = TopicRationalizer(CorpusDB())
+    
+    console.print("[blue]Running Pass 1: Scanning for exact duplicates (Similarity ≥ 0.999)...[/blue]")
+    exact_count = rat.auto_resolve_exact_matches()
+    
+    console.print("[blue]Running Pass 2: Scanning for subset inclusions...[/blue]")
+    subset_count = rat.auto_resolve_subsets()
+    
+    total = exact_count + subset_count
+    
+    if total > 0:
+        console.print(f"\n[bold green]✓ Auto-resolved {total} redundant pairs![/bold green]")
+        console.print(f"  - Exact Matches: {exact_count}")
+        console.print(f"  - Subset Inclusions: {subset_count}")
+    else:
+        console.print("\n[yellow]No algorithmic redundancies found. Remaining pairs require human/LLM review.[/yellow]")
+
+def auto_resolve_subsets(self) -> int:
+        """
+        Automatically resolves pending cross-references where one chunk's text 
+        is a complete substring of the other. 
+        Preserves the larger, encompassing chunk.
+        
+        Returns:
+            The number of cross-references automatically resolved.
+        """
+        pending = self.db.get_pending_cross_refs()
+        resolved_count = 0
+        
+        for ref in pending:
+            text_a = ref["content_a"].strip()
+            text_b = ref["content_b"].strip()
+            
+            # Skip if they are exactly identical (handled by exact match resolver)
+            if text_a == text_b:
+                continue
+                
+            # If A is entirely contained within B, B is the superset.
+            if text_a in text_b:
+                self.db.resolve_cross_ref(
+                    cross_ref_id=ref["id"], 
+                    status="accepted", 
+                    resolved_by="auto_subset", 
+                    resolved_text=ref["content_b"]
+                )
+                resolved_count += 1
+                
+            # If B is entirely contained within A, A is the superset.
+            elif text_b in text_a:
+                self.db.resolve_cross_ref(
+                    cross_ref_id=ref["id"], 
+                    status="accepted", 
+                    resolved_by="auto_subset", 
+                    resolved_text=ref["content_a"]
+                )
+                resolved_count += 1
+                
+        return resolved_count
+
 # ═══════════════════════════════════════════════════════════════════════
 # Argument parser
 # ═══════════════════════════════════════════════════════════════════════
@@ -428,6 +597,9 @@ def build_parser() -> argparse.ArgumentParser:
     db_sub = p_db.add_subparsers(dest="db_command", metavar="<subcommand>")
     db_sub.add_parser("optimize", help="Run VACUUM and ANALYZE to reclaim space")
 
+    db_sub.add_parser("resolve", help="Interactive loop to review and merge overlapping chunks")
+    db_sub.add_parser("auto-resolve", help="Automatically deduplicate exact 1.0 matches")
+
     # cf search <query>
     p_search = sub.add_parser("search", help="Semantic search across all chunks")
     p_search.add_argument("query", help="Natural language search query")
@@ -446,6 +618,11 @@ def build_parser() -> argparse.ArgumentParser:
     topic_sub = p_topic.add_subparsers(dest="topic_command", metavar="<subcommand>")
     p_topic_show = topic_sub.add_parser("show", help="Show all text chunks for a specific topic")
     p_topic_show.add_argument("topic_id", type=int, help="Topic ID (from cf topics)")
+
+    # ADD THESE LINES:
+    p_topic_rat = topic_sub.add_parser("rationalize", help="Find redundant or overlapping chunks within a topic")
+    p_topic_rat.add_argument("topic_id", type=int, help="Topic ID to analyze")
+    p_topic_rat.add_argument("--threshold", type=float, default=0.85, dest="threshold", help="Similarity threshold (default 0.85)")
 
     # Phase 3 Compiler tools (DUPLICATE REMOVED)
     topic_sub.add_parser("compile", help="Weave chunks into a synthesized Markdown document").add_argument("topic_id", type=int)
@@ -480,11 +657,14 @@ def main() -> None:
                 "show": cmd_topic_show, 
                 "compile": cmd_topic_compile, 
                 "outline": cmd_topic_outline, 
-                "export-linear": cmd_topic_export_linear
-                "summarize": cmd_topic_summarize  # <--- ADD THIS LINE!
+                "export-linear": cmd_topic_export_linear,
+                "summarize": cmd_topic_summarize,  # <--- ADD THIS LINE!
+                "rationalize": cmd_topic_rationalize  # <--- ADD THIS LINE!
             },
             "db": {
-                "optimize": cmd_db_optimize
+                "optimize": cmd_db_optimize,
+                "resolve": cmd_db_resolve,  # <--- ADD THIS LINE!
+                "auto-resolve": cmd_db_autoresolve,  # <--- ADD THIS LINE!
             }
         }
 

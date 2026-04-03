@@ -219,12 +219,38 @@ class CorpusSummarizer:
 
     def propose_merge(self, text_a: str, text_b: str) -> str:
         """
-        Phase 4 stub: draft merged text for two overlapping chunks.
-        Implement during the rationalization phase.
-        """
-        raise NotImplementedError("propose_merge() is a Phase 4 feature.")
+        Drafts a unified, merged text from two overlapping chunks.
 
-    # FUTURE: Local summarization strategy (implement at Phase 3)
+        This uses the LLM as an automated editor to identify the unique facts 
+        in both chunks and weave them together into a single, cohesive paragraph 
+        without losing any granular detail.
+
+        Args:
+            text_a: The first chunk's content.
+            text_b: The second chunk's content.
+
+        Returns:
+            A string containing the LLM's proposed merged text.
+        """
+        system = (
+            "You are a meticulous technical editor and archivist. "
+            "You will be given two text snippets from a personal knowledge base that have been "
+            "mathematically identified as overlapping or highly similar.\n\n"
+            "Your task is to merge them into a single, cohesive snippet. "
+            "You must:\n"
+            "1. Remove all redundant phrasing.\n"
+            "2. Preserve EVERY unique technical fact, detail, and piece of context from BOTH snippets.\n"
+            "3. Ensure the resulting text flows naturally as a single thought.\n\n"
+            "Output ONLY the merged text. Do not include markdown blocks, pleasantries, or explanations."
+        )
+        
+        prompt = f"--- Snippet A ---\n{text_a}\n\n--- Snippet B ---\n{text_b}"
+
+        # We use a lower temperature (0.2) because we want factual consolidation, 
+        # not creative hallucination.
+        result = self._generate(system, prompt, temperature=0.2)
+        return result or "Error: LLM could not generate a merge proposal."
+
     # Once chunk_topics are populated, a local summary can be assembled from:
     #   - The document title and heading_path outline
     #   - Top 3 topics by relevance (from the file_topics view)
