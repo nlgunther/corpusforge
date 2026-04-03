@@ -70,7 +70,7 @@ class TopicEngine:
             min_cluster_size=self.min_cluster_size,
             metric="euclidean",              # equivalent to cosine for L2-normalised vectors
             cluster_selection_method="eom",  # Excess of Mass: finds stable, broad clusters
-            copy=True,   # explicit: suppress sklearn FutureWarning re default change
+            copy=True,                       # explicit: suppress sklearn FutureWarning re default change
         )
         clusterer.fit(vectors)
 

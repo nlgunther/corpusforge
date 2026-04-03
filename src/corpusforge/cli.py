@@ -358,6 +358,33 @@ def cmd_topic_compile(args: argparse.Namespace) -> None:
     if result:
         console.print(f"\n[bold green]✓ Success![/bold green] Synthesized document saved to: [cyan]{result.output_path}[/cyan]\n")
 
+def cmd_topic_summarize(args: argparse.Namespace) -> None:
+    """cf topic summarize <id> — Generate English name/desc for a single topic."""
+    from .summarizer import CorpusSummarizer
+    db = CorpusDB()
+
+    chunks = db.get_chunks_for_topic(args.topic_id)
+    if not chunks:
+        console.print(f"[yellow]No chunks found for Topic {args.topic_id}.[/yellow]")
+        return
+
+    console.print(f"Analyzing Topic {args.topic_id} with Gemini...")
+    summarizer = CorpusSummarizer()
+
+    # Take top 3 chunks (matches Claude's logic in topic_engine to save tokens)
+    sample_texts = [c["content"] for c in chunks[:3]]
+    metadata = summarizer.name_topic(sample_texts)
+
+    db.update_topic(
+        topic_id=args.topic_id,
+        name=metadata.get("name", "Unnamed Topic"),
+        description=metadata.get("description", "")
+    )
+
+    console.print(f"\n[bold green]✓ Topic Updated![/bold green]")
+    console.print(f"[bold]New Name:[/bold] {metadata.get('name')}")
+    console.print(f"[bold]Description:[/bold] {metadata.get('description')}\n")
+
 # ═══════════════════════════════════════════════════════════════════════
 # Argument parser
 # ═══════════════════════════════════════════════════════════════════════
@@ -425,6 +452,8 @@ def build_parser() -> argparse.ArgumentParser:
     topic_sub.add_parser("outline", help="Generate a hierarchical checklist for a topic").add_argument("topic_id", type=int)
     topic_sub.add_parser("export-linear", help="Reconstruct topic chunks in their original reading order").add_argument("topic_id", type=int)
 
+    topic_sub.add_parser("summarize", help="Generate English name/desc for a single topic").add_argument("topic_id", type=int)
+
     return parser
 
 
@@ -452,6 +481,7 @@ def main() -> None:
                 "compile": cmd_topic_compile, 
                 "outline": cmd_topic_outline, 
                 "export-linear": cmd_topic_export_linear
+                "summarize": cmd_topic_summarize  # <--- ADD THIS LINE!
             },
             "db": {
                 "optimize": cmd_db_optimize
